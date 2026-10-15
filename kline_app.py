@@ -11,6 +11,7 @@ Self-hosted K-line (candlestick) chart viewer with watchlist + technical indicat
 """
 
 import json
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,9 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
+
+# 把 yfinance 自己的 404 / delisted 警告壓掉(resolve 時故意會試到錯的後綴)
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 # ---------- 路徑設定 ----------
 # 預設存在 app 目錄下的 .kline_data,Streamlit Cloud 上會跨重啟保留(同 deploy)
@@ -226,6 +230,21 @@ def fetch_quote(ticker: str) -> dict:
         }
     except Exception:
         return {"price": None, "prev_close": None, "currency": "", "name": ticker}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def resolve_tw_ticker(raw: str) -> str:
+    """遇到 4 位純數字 → 試 .TW → .TWO,回傳第一個抓得到的;抓不到就原樣回傳。"""
+    if not (raw.isdigit() and len(raw) == 4):
+        return raw
+    for suffix in (".TW", ".TWO"):
+        try:
+            h = yf.Ticker(raw + suffix).history(period="5d", interval="1d", auto_adjust=False)
+            if h is not None and not h.empty:
+                return raw + suffix
+        except Exception:
+            pass
+    return raw
 
 
 # ---------- 指標計算 ----------
@@ -463,6 +482,24 @@ st.caption("資料來源: Yahoo Finance via yfinance · TradingView-style dark t
 
 watchlist = load_watchlist()
 
+# 啟動時 backfill: 自動把舊的 4 碼台股補上後綴
+_backfill_changed = False
+_backfill_msgs: list[str] = []
+for w in watchlist:
+    orig = w["ticker"]
+    if orig.isdigit() and len(orig) == 4:
+        resolved = resolve_tw_ticker(orig)
+        if resolved != orig:
+            w["ticker"] = resolved
+            _backfill_changed = True
+            _backfill_msgs.append(f"{orig}→{resolved}")
+if _backfill_changed:
+    save_watchlist(watchlist)
+    st.toast(
+        f"🔍 backfill {len(_backfill_msgs)} 個台股代號: {', '.join(_backfill_msgs)}",
+        icon="🔍",
+    )
+
 with st.sidebar:
     st.header("➕ 快速匯入")
     raw = st.text_area(
@@ -475,18 +512,28 @@ with st.sidebar:
         new = parse_tickers(raw)
         existing = {w["ticker"] for w in watchlist}
         added = []
+        resolved_msgs = []
         for t in new:
-            if t not in existing:
-                quote = fetch_quote(t)
-                watchlist.append({
-                    "ticker": t,
-                    "name": quote["name"] or t,
-                    "added_at": datetime.now().isoformat(timespec="seconds"),
-                })
-                added.append(t)
+            # 4 位數 → 自動加 .TW / .TWO 後綴
+            resolved = resolve_tw_ticker(t)
+            if resolved != t:
+                resolved_msgs.append(f"{t}→{resolved}")
+            if resolved in existing:
+                continue
+            quote = fetch_quote(resolved)
+            watchlist.append({
+                "ticker": resolved,
+                "name": quote["name"] or resolved,
+                "added_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            added.append(resolved)
+            existing.add(resolved)
         if added:
             save_watchlist(watchlist)
-            st.success(f"已加入: {', '.join(added)}")
+            msg = f"已加入: {', '.join(added)}"
+            if resolved_msgs:
+                msg += "\n\n🔍 台股自動加後綴: " + ", ".join(resolved_msgs)
+            st.success(msg)
             st.rerun()
         else:
             st.info("沒有新股號(可能已在清單中)")
@@ -599,13 +646,77 @@ st.dataframe(
 )
 
 st.subheader("K 線檢視")
+
 tickers = [w["ticker"] for w in watchlist]
-selected = st.selectbox("選擇股號", tickers)
-to_remove = st.button("🗑️ 從 watchlist 移除此股")
-if to_remove:
-    watchlist = [w for w in watchlist if w["ticker"] != selected]
-    save_watchlist(watchlist)
-    st.rerun()
+n = len(tickers)
+
+# 從 URL 讀目前選到的 index(預設 0)
+try:
+    sel_idx = int(st.query_params.get("sel", "0"))
+except (ValueError, TypeError):
+    sel_idx = 0
+sel_idx = max(0, min(sel_idx, n - 1))
+selected = tickers[sel_idx]
+
+# 鍵盤方向鍵監聽(用 query_params + reload 達成全局快捷鍵)
+st.components.v1.html(
+    """
+    <script>
+    (function(){
+        let last = 0;
+        function handler(e){
+            const ae = document.activeElement;
+            if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
+            if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+            const now = Date.now();
+            if (now - last < 150) return;  // debounce
+            last = now;
+            e.preventDefault();
+            const url = new URL(window.parent.location);
+            let cur = parseInt(url.searchParams.get('sel') || '0', 10);
+            if (e.key === 'ArrowDown') cur++;
+            else cur = Math.max(0, cur - 1);
+            url.searchParams.set('sel', cur);
+            window.parent.location.href = url.toString();
+        }
+        document.addEventListener('keydown', handler);
+        window.addEventListener('keydown', handler);
+    })();
+    </script>
+    """,
+    height=0,
+)
+
+# 導航列:◀ ticker ▶  (i/N)
+nav1, nav2, nav3, nav4 = st.columns([1, 6, 1, 1])
+with nav1:
+    if st.button("◀", key="prev_btn", use_container_width=True, disabled=(sel_idx == 0)):
+        st.query_params["sel"] = str(sel_idx - 1)
+        st.rerun()
+with nav2:
+    cur_name = next((w["name"] for w in watchlist if w["ticker"] == selected), "")
+    st.markdown(
+        f"<div style='line-height:1.1; padding:4px 0;'>"
+        f"<span style='color:#787b86; font-size:12px;'>{sel_idx + 1} / {n}</span> "
+        f"&nbsp;<span style='color:#d1d4dc; font-size:18px; font-weight:600;'>{selected}</span>"
+        + (f" <span style='color:#787b86; font-size:13px;'>· {cur_name}</span>" if cur_name and cur_name != selected else "")
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+with nav3:
+    if st.button("▶", key="next_btn", use_container_width=True, disabled=(sel_idx == n - 1)):
+        st.query_params["sel"] = str(sel_idx + 1)
+        st.rerun()
+with nav4:
+    if st.button("🗑️", key="remove_btn", use_container_width=True):
+        watchlist = [w for w in watchlist if w["ticker"] != selected]
+        save_watchlist(watchlist)
+        # 移除後 sel 留在原位(已經指向下一檔),若到末尾就往前一檔
+        new_n = len(watchlist)
+        st.query_params["sel"] = str(min(sel_idx, new_n - 1)) if new_n > 0 else "0"
+        st.rerun()
+
+st.caption("💡 按 ↑/↓ 鍵盤切換 · ◀/▶ 點按鈕 · 焦點在輸入框時方向鍵不會被攔截")
 
 period, interval = PERIODS[period_label]
 with st.spinner(f"抓取 {selected} {period_label} 資料..."):
