@@ -47,8 +47,8 @@ TV_COLORS = {
     "down":          "#ef5350",   # 跌紅
     "crosshair":     "#758696",   # 十字游標線
     "hover_bg":      "#363a45",   # hover label 背景
-    "bb_fill":       "rgba(120,180,255,0.10)",
-    "bb_line":       "#90caf9",
+    "bb_fill":       "rgba(79,195,247,0.15)",
+    "bb_line":       "#4fc3f7",
     "sma_palette":   ["#fdd835", "#42a5f5", "#ab47bc", "#66bb6a", "#ff7043", "#26c6da"],
     "font":          "-apple-system, BlinkMacSystemFont, 'Trebuchet MS', Roboto, Ubuntu, sans-serif",
 }
@@ -313,26 +313,28 @@ def make_chart(df: pd.DataFrame, ticker: str, ind: dict) -> go.Figure:
         row=rmap["price"], col=1,
     )
 
-    # BB
+    # BB — 上/中/下三軌都畫,上下用點線明顯標出邊界,中間用實線,通道填色
     if ind["bb"]["enabled"]:
         p, s = ind["bb"]["period"], ind["bb"]["std"]
         upper, mid, lower = _bb_bands(df["Close"], p, s)
-        # 上軌(隱形,給 fill 參考)
+        # 上軌(可見點線,當 fill 的上界)
         fig.add_trace(go.Scatter(
             x=df["Date"], y=upper, mode="lines",
-            line=dict(width=0), showlegend=False, hoverinfo="skip",
+            line=dict(color=C["bb_line"], width=1.3, dash="dot"),
+            showlegend=False, hoverinfo="skip",
         ), row=rmap["price"], col=1)
-        # 下軌 + 填色
+        # 下軌(可見點線 + 通道填色)
         fig.add_trace(go.Scatter(
             x=df["Date"], y=lower, mode="lines",
-            line=dict(width=0), fill="tonexty",
+            line=dict(color=C["bb_line"], width=1.3, dash="dot"),
+            fill="tonexty",
             fillcolor=C["bb_fill"],
             showlegend=False, hoverinfo="skip",
         ), row=rmap["price"], col=1)
-        # 中軌(顯示在圖例)
+        # 中軌(實心線,顯示在圖例)
         fig.add_trace(go.Scatter(
             x=df["Date"], y=mid, mode="lines",
-            name=f"BB({p},{s})", line=dict(color=C["bb_line"], width=1),
+            name=f"BB({p},{s})", line=dict(color=C["bb_line"], width=1.8),
         ), row=rmap["price"], col=1)
 
     palette = C["sma_palette"]
@@ -658,29 +660,38 @@ except (ValueError, TypeError):
 sel_idx = max(0, min(sel_idx, n - 1))
 selected = tickers[sel_idx]
 
-# 鍵盤方向鍵監聽(用 query_params + reload 達成全局快捷鍵)
+# 鍵盤方向鍵監聽 — 掛到 parent document(因為鍵盤焦點在 parent),用 capture phase + preventDefault 攔截預設捲動
 st.components.v1.html(
     """
     <script>
     (function(){
-        let last = 0;
-        function handler(e){
-            const ae = document.activeElement;
-            if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
-            if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
-            const now = Date.now();
-            if (now - last < 150) return;  // debounce
-            last = now;
-            e.preventDefault();
-            const url = new URL(window.parent.location);
-            let cur = parseInt(url.searchParams.get('sel') || '0', 10);
-            if (e.key === 'ArrowDown') cur++;
-            else cur = Math.max(0, cur - 1);
-            url.searchParams.set('sel', cur);
-            window.parent.location.href = url.toString();
+        try {
+            var parent = window.parent;
+            if (!parent || parent === window) return;
+            if (parent.__klineArrowAttached) return;  // 同一頁不要重複掛
+            var last = 0;
+            function handler(e) {
+                var ae = parent.document.activeElement;
+                if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
+                if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+                var now = Date.now();
+                if (now - last < 150) return;  // debounce
+                last = now;
+                e.preventDefault();
+                e.stopPropagation();
+                var url = new URL(parent.location);
+                var cur = parseInt(url.searchParams.get('sel') || '0', 10);
+                if (e.key === 'ArrowDown') cur++;
+                else cur = Math.max(0, cur - 1);
+                url.searchParams.set('sel', cur);
+                parent.location.href = url.toString();
+            }
+            // capture: true 確保我們比預設捲動行為先拿到事件
+            parent.document.addEventListener('keydown', handler, { capture: true });
+            parent.__klineArrowAttached = true;
+        } catch (err) {
+            // 跨來源或 parent 不可用時靜默失敗
         }
-        document.addEventListener('keydown', handler);
-        window.addEventListener('keydown', handler);
     })();
     </script>
     """,
